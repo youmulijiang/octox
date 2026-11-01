@@ -1,0 +1,17 @@
+[package]
+name = "octox"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64 = "0.23.1"
+chrono = "0.4.45"
+csv = "1.4.0"
+dirs = "7.0.0"
+futures = "0.3.34"
+gpui = "0.2.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+unicode-segmentation = "1.13.3"
+ureq = { version = "3.5.0", features = ["json"] }
+urlencoding = "2.1.3"
