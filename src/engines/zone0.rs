@@ -96,6 +96,7 @@ pub(crate) fn parse_response(v: &Value) -> Result<SearchResult> {
         total,
         assets,
         quota: None,
+        next_cursor: None,
     })
 }
 

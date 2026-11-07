@@ -139,6 +139,7 @@ pub(crate) fn parse_response(v: &Value, extra_fields: &[&str]) -> Result<SearchR
         total,
         assets,
         quota: None,
+        next_cursor: None,
     })
 }
 

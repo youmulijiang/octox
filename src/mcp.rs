@@ -23,7 +23,7 @@ use serde_json::{Map, Value, json};
 
 use crate::asset::{Asset, Engine};
 use crate::config::{Config, parse_tags};
-use crate::translate;
+use crate::search::{self, SearchPlan};
 
 /// 启动 stdio MCP 服务：逐行读取请求、写出响应，stdin 关闭时退出。
 pub fn run_server() {
@@ -135,7 +135,8 @@ fn tools_manifest() -> Value {
                     "engine": {"type": "string", "enum": ["fofa", "hunter", "quake", "shodan", "zoomeye", "threatbook", "zone0", "daydaymap", "virustotal", "censys", "all"], "description": "目标引擎；all = 按设置中参与聚合的引擎"},
                     "query": {"type": "string", "description": "查询语句，如 ip=\"1.2.3.4\" && port=80"},
                     "page": {"type": "integer", "minimum": 1, "description": "页码，默认 1（受最大页数设置限制）"},
-                    "size": {"type": "integer", "minimum": 1, "maximum": 100, "description": "每页条数，默认 20"}
+                    "size": {"type": "integer", "minimum": 1, "maximum": 100, "description": "请求每页条数；Shodan 固定 100，ZoomEye 固定 20"},
+                    "cursors": {"type": "object", "additionalProperties": {"type": "string"}, "description": "后续页将上一页各引擎的 next_cursor 按引擎名传入，如 virustotal、censys；保持 query 和 size 不变"}
                 },
                 "required": ["engine", "query"]
             }
@@ -190,8 +191,36 @@ fn call_tool(params: &Value) -> Result<Value, (i64, String)> {
     }))
 }
 
+fn search_parameters(args: &Value, config: &Config) -> Result<(u32, u32), String> {
+    let integer = |key: &str, default: u64, max: u64| -> Result<u32, String> {
+        let value = match args.get(key) {
+            None => default,
+            Some(v) => v.as_u64().ok_or_else(|| format!("{key} 必须为正整数"))?,
+        };
+        if value == 0 || value > max {
+            return Err(format!("{key} 必须在 1..={max} 之间"));
+        }
+        Ok(value as u32)
+    };
+    Ok((
+        integer("page", 1, config.max_pages.max(1) as u64)?,
+        integer("size", config.page_size.clamp(1, 100) as u64, 100)?,
+    ))
+}
+
 fn tool_search(args: &Value) -> Result<String, String> {
-    let engine = args.get("engine").and_then(Value::as_str).unwrap_or("all");
+    let engine = match args.get("engine") {
+        None => "all",
+        Some(v) => v.as_str().ok_or("engine 必须为引擎名称字符串")?,
+    };
+    if let Some(cursors) = args.get("cursors") {
+        let cursors = cursors
+            .as_object()
+            .ok_or("cursors 必须为引擎名到游标的对象")?;
+        if cursors.values().any(|v| !v.is_string()) {
+            return Err("游标必须为字符串".into());
+        }
+    }
     let query = args
         .get("query")
         .and_then(Value::as_str)
@@ -201,84 +230,72 @@ fn tool_search(args: &Value) -> Result<String, String> {
     if query.is_empty() {
         return Err("query 不能为空".into());
     }
-    let page_raw = args.get("page").and_then(Value::as_u64).unwrap_or(1).max(1) as u32;
-    let size = args
-        .get("size")
-        .and_then(Value::as_u64)
-        .unwrap_or(20)
-        .clamp(1, 100) as u32;
-
     let config = Config::load();
-    let page = page_raw.min(config.max_pages.max(1));
-
-    let engines: Vec<Engine> = match engine {
-        "fofa" => vec![Engine::Fofa],
-        "hunter" => vec![Engine::Hunter],
-        "quake" => vec![Engine::Quake],
-        "shodan" => vec![Engine::Shodan],
-        "zoomeye" => vec![Engine::ZoomEye],
-        "threatbook" => vec![Engine::ThreatBook],
-        "zone0" => vec![Engine::Zone0],
-        "daydaymap" => vec![Engine::DayDayMap],
-        "virustotal" => vec![Engine::VirusTotal],
-        "censys" => vec![Engine::Censys],
-        _ => Engine::ALL
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| config.aggregate_engines[*i])
-            .map(|(_, e)| *e)
-            .collect(),
+    let (page, size) = search_parameters(args, &config)?;
+    let single = match engine {
+        "all" => None,
+        name => Some(
+            Engine::ALL
+                .iter()
+                .copied()
+                .find(|e| {
+                    e.name().to_lowercase() == name || (name == "zone0" && *e == Engine::Zone0)
+                })
+                .ok_or_else(|| format!("未知引擎：{name}"))?,
+        ),
     };
-    if engines.is_empty() {
-        return Err("聚合模式没有参与引擎 — 请在 octox 设置中勾选".into());
-    }
-
-    // 多引擎（聚合）只允许公共语法，先统一校验再按方言翻译。
-    let aggregate = engines.len() > 1;
-    let parsed = if aggregate {
-        Some(translate::parse_common(&query).map_err(|e| format!("聚合搜索仅支持公共语法：{e}"))?)
-    } else {
-        None
-    };
-
+    let plan = SearchPlan::prepare(&config, &query, single)?;
+    let cursors = args.get("cursors").and_then(Value::as_object);
     let mut report = Map::new();
     report.insert("query".into(), json!(query));
     report.insert("page".into(), json!(page));
     report.insert("size".into(), json!(size));
-    for engine in engines {
-        let key = engine.name().to_lowercase();
-        if !config.creds_ready(engine) {
-            report.insert(key.clone(), json!({"error": "未配置凭证"}));
-            continue;
+    // 与 GUI 一样并发执行，并按配置错峰；结果按引擎顺序输出。
+    let entries = std::thread::scope(|scope| {
+        let mut tasks = Vec::new();
+        let mut sequence = 0;
+        for (engine, prepared) in plan.queries {
+            let cfg = &config;
+            let key = if engine == Engine::Zone0 {
+                "zone0".to_string()
+            } else {
+                engine.name().to_lowercase()
+            };
+            let cursor = cursors.and_then(|c| c.get(&key)).and_then(Value::as_str);
+            let delay = if prepared.is_ok() {
+                let n = sequence;
+                sequence += 1;
+                cfg.request_delay_secs.min(60) * n
+            } else {
+                0
+            };
+            tasks.push(scope.spawn(move || {
+                let entry = match prepared {
+                    Err(e) => json!({"error": e}),
+                    Ok(engine_query) => {
+                        if delay > 0 {
+                            std::thread::sleep(Duration::from_secs(delay));
+                        }
+                        match engine.search_page(cfg, &engine_query, page, size, cursor) {
+                            Ok(sr) => json!({"query": engine_query, "total": sr.total,
+                                "quota": sr.quota, "next_cursor": sr.next_cursor,
+                                "has_more": search::has_more(engine, &sr, page, size),
+                                "page_size": engine.effective_size(size),
+                                "assets": sr.assets.iter().map(asset_json).collect::<Vec<_>>() }),
+                            Err(e) => json!({"error": e.to_string()}),
+                        }
+                    }
+                };
+                (key, entry)
+            }));
         }
-        let engine_query = match &parsed {
-            Some(node) => match translate::render(node, engine) {
-                Ok(q) => q,
-                Err(e) => {
-                    report.insert(key.clone(), json!({"error": e}));
-                    continue;
-                }
-            },
-            None => query.clone(),
-        };
-        match engine.search(&config, &engine_query, page, size) {
-            Ok(sr) => {
-                let mut entry = Map::new();
-                entry.insert("query".into(), json!(engine_query));
-                entry.insert("total".into(), json!(sr.total));
-                if let Some(quota) = &sr.quota {
-                    entry.insert("quota".into(), json!(quota));
-                }
-                entry.insert(
-                    "assets".into(),
-                    json!(sr.assets.iter().map(asset_json).collect::<Vec<_>>()),
-                );
-                report.insert(key, Value::Object(entry));
-            }
-            Err(e) => {
-                report.insert(key.clone(), json!({"error": e.to_string()}));
-            }
-        }
+        tasks
+            .into_iter()
+            .map(|t| t.join().map_err(|_| "搜索任务异常退出".to_string()))
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+    for (key, entry) in entries {
+        report.insert(key, entry);
     }
     Ok(Value::Object(report).to_string())
 }
@@ -387,6 +404,27 @@ fn asset_json(asset: &Asset) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_out_of_range_pages_without_wrapping_or_clamping() {
+        let config = Config::default();
+        for v in [
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!(4294967297_u64),
+            json!(6),
+        ] {
+            assert!(search_parameters(&json!({"page":v}), &config).is_err());
+        }
+        assert_eq!(search_parameters(&json!({}), &config).unwrap(), (1, 20));
+        assert!(search_parameters(&json!({"size":101}), &config).is_err());
+        assert!(
+            tool_search(&json!({"engine":"typo","query":"port=80"}))
+                .unwrap_err()
+                .contains("未知引擎")
+        );
+    }
 
     #[test]
     fn manifest_exposes_four_tools() {

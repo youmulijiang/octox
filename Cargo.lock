@@ -3713,6 +3713,7 @@ dependencies = [
  "gpui",
  "serde",
  "serde_json",
+ "tempfile",
  "unicode-segmentation",
  "ureq",
  "urlencoding",

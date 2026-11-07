@@ -7,6 +7,8 @@ mod config;
 mod engines;
 mod export;
 mod mcp;
+mod search;
+mod tools;
 mod translate;
 mod ui;
 

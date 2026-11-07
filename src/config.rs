@@ -272,14 +272,22 @@ impl Config {
     }
 
     pub fn save(&self) -> io::Result<()> {
-        let path = Self::config_path();
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(
-            path,
-            serde_json::to_string_pretty(self).expect("serialize config"),
-        )
+        self.save_to(&Self::config_path())
+    }
+
+    fn save_to(&self, path: &std::path::Path) -> io::Result<()> {
+        use std::io::Write;
+        let dir = path
+            .parent()
+            .ok_or_else(|| io::Error::other("配置路径缺少父目录"))?;
+        std::fs::create_dir_all(dir)?;
+        // 同目录临时文件 + 原子替换，写入失败时保留旧文件。
+        let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+        serde_json::to_writer_pretty(&mut temp, self).map_err(io::Error::other)?;
+        temp.flush()?;
+        temp.as_file().sync_all()?;
+        temp.persist(path).map_err(|e| e.error)?;
+        Ok(())
     }
 
     /// 引擎凭证是否已配置。
@@ -359,6 +367,25 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_atomically_replaces_existing_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut config = Config::default();
+        config.save_to(&path).unwrap();
+        config.page_size = 50;
+        config.save_to(&path).unwrap();
+        let saved: Config = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved.page_size, 50);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        let invalid = path.join("config.json");
+        assert!(config.save_to(&invalid).is_err());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            serde_json::to_vec_pretty(&saved).unwrap()
+        );
+    }
 
     #[test]
     fn parse_tags_splits_and_dedupes() {

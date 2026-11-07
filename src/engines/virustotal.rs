@@ -14,24 +14,31 @@ use crate::config::Config;
 
 const ENDPOINT: &str = "https://www.virustotal.com/api/v3/intelligence/search";
 
-pub(crate) fn build_url(query: &str, limit: u32, offset: &str) -> String {
-    format!(
-        "{ENDPOINT}?query={}&limit={limit}&offset={}",
+pub(crate) fn build_url(query: &str, limit: u32, cursor: Option<&str>) -> String {
+    let mut url = format!(
+        "{ENDPOINT}?query={}&limit={}",
         urlencoding::encode(query),
-        urlencoding::encode(offset),
-    )
+        limit.clamp(1, 100)
+    );
+    if let Some(cursor) = cursor.filter(|s| !s.is_empty()) {
+        url.push_str(&format!("&cursor={}", urlencoding::encode(cursor)));
+    }
+    url
 }
 
-pub(crate) fn search(config: &Config, query: &str, page: u32, size: u32) -> Result<SearchResult> {
+pub(crate) fn search(
+    config: &Config,
+    query: &str,
+    size: u32,
+    cursor: Option<&str>,
+) -> Result<SearchResult> {
     let creds = &config.virustotal;
     if creds.api_key.trim().is_empty() {
         return Err(EngineError::Api(
             "VirusTotal: 未配置 x-apikey（右上角设置）".into(),
         ));
     }
-    // VT 搜索为游标分页：用 offset 模拟页码（page-1) * size。
-    let offset = ((page.max(1) - 1) * size.clamp(1, 40)).to_string();
-    let url = build_url(query, size.clamp(1, 40), &offset);
+    let url = build_url(query, size, cursor);
     let value =
         super::fetch_json_with_headers(config, &url, &[("x-apikey", creds.api_key.trim())])?;
     let enabled = config
@@ -57,10 +64,9 @@ pub(crate) fn parse_response(v: &Value, enabled: Option<&[String]>) -> Result<Se
     let rows = v
         .get("data")
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+        .ok_or_else(|| EngineError::Parse("VirusTotal: 缺少 data 数组".into()))?;
     let mut assets = Vec::with_capacity(rows.len());
-    for item in &rows {
+    for item in rows {
         let entity_type = field(item, "type");
         let id = field(item, "id");
         // 实体泛化：IP → host=ip；域名 → host=domain；其余以 id 展示。
@@ -111,6 +117,11 @@ pub(crate) fn parse_response(v: &Value, enabled: Option<&[String]>) -> Result<Se
         total,
         assets,
         quota: None,
+        next_cursor: v
+            .pointer("/meta/cursor")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
     })
 }
 
@@ -120,8 +131,23 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn cursor_is_opaque_and_returned_for_next_page() {
+        let url = build_url("entity:domain", 20, Some("token+/="));
+        assert!(url.contains("cursor=token%2B%2F%3D"));
+        assert!(!url.contains("offset="));
+        assert!(!build_url("test", 20, None).contains("cursor="));
+        let r = parse_response(&json!({"data": [], "meta": {"cursor": "token+/="}}), None).unwrap();
+        assert_eq!(r.next_cursor.as_deref(), Some("token+/="));
+        assert!(parse_response(&json!({"meta": {}}), None).is_err());
+        let error = Engine::VirusTotal
+            .search(&Config::default(), "test", 2, 20)
+            .unwrap_err();
+        assert!(error.to_string().contains("next_cursor"));
+    }
+
+    #[test]
     fn build_url_encodes_query() {
-        let url = build_url("entity:domain domain:baidu.com", 40, "0");
+        let url = build_url("entity:domain domain:baidu.com", 40, None);
         assert!(url.starts_with(ENDPOINT));
         assert!(!url.contains("apikey"));
         assert!(url.contains("limit=40"));

@@ -105,6 +105,7 @@ pub(crate) fn parse_response(v: &Value, enabled: Option<&[String]>) -> Result<Se
         total,
         assets,
         quota: None,
+        next_cursor: None,
     })
 }
 

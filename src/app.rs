@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use gpui::{
     Animation, AnimationExt, ClickEvent, ClipboardItem, Context, Div, Entity, MouseButton,
-    MouseDownEvent, Render, SharedString, Window, actions, deferred, div, ease_out_quint,
+    MouseDownEvent, Render, SharedString, Stateful, Window, actions, deferred, div, ease_out_quint,
     linear_color_stop, linear_gradient, prelude::*, px, rgb, rgba, uniform_list,
 };
 
@@ -15,6 +15,8 @@ use crate::config::{Config, parse_tags};
 use crate::engines::{self, SearchResult};
 use crate::export;
 use crate::mcp;
+use crate::search::{self, PageCache, SearchPlan};
+use crate::tools;
 use crate::translate;
 use crate::ui::dropdown::{DropdownEvent, EngineDropdown, SearchMode};
 use crate::ui::icons::{self, icon};
@@ -31,7 +33,7 @@ actions!(
 const FAVORITE_COLOR: u32 = 0xf5c518;
 
 // 结果表列宽（px）；宽度为 0 表示弹性列。
-const COL_ENGINE: f32 = 56.;
+const COL_ENGINE: f32 = 92.;
 const COL_HOST: f32 = 200.;
 const COL_IP: f32 = 128.;
 const COL_PORT: f32 = 52.;
@@ -129,6 +131,15 @@ pub struct Toast {
     message: String,
 }
 
+/// 小工具 favicon 计算状态机。
+#[derive(Debug, Clone)]
+enum ToolFaviconState {
+    Idle,
+    Loading,
+    Done { icon_url: String, hash: i32 },
+    Failed(String),
+}
+
 pub struct OctoxApp {
     pub query_input: Entity<TextInput>,
     engine_dropdown: Entity<EngineDropdown>,
@@ -152,6 +163,7 @@ pub struct OctoxApp {
     fav_query_input: Entity<TextInput>,
     fav_tags_input: Entity<TextInput>,
     fav_note_input: Entity<TextInput>,
+    tool_url_input: Entity<TextInput>,
     config: Config,
     results: Vec<Asset>,
     selected: Option<usize>,
@@ -161,7 +173,14 @@ pub struct OctoxApp {
     pending: usize,
     loading: bool,
     page: u32,
+    active_size: u32,
     last_query: String,
+    page_cache: PageCache,
+    next_pages: [bool; Engine::COUNT],
+    cancelled: Arc<AtomicBool>,
+    extra_labels: Vec<String>,
+    show_search_details: bool,
+    detail_expanded: bool,
     search_gen: u64,
     show_settings: bool,
     settings_tab: usize,
@@ -172,6 +191,10 @@ pub struct OctoxApp {
     show_fav_dialog: bool,
     /// 收藏对话框正在编辑的语句（None = 新增）。
     fav_dialog_existing: Option<String>,
+    /// 小工具弹层开关与 favicon 计算状态（tool_gen 丢弃过期结果）。
+    show_tools: bool,
+    tool_favicon_state: ToolFaviconState,
+    tool_gen: u64,
     suggestions: Vec<Completion>,
     suggest_active: Option<usize>,
     status: String,
@@ -231,6 +254,13 @@ impl OctoxApp {
         let fav_query_input = mk("查询语句", "", cx);
         let fav_tags_input = mk("标签，逗号分隔，如: 后台,邮件", "", cx);
         let fav_note_input = mk("一句话描述用途（可空）", "", cx);
+        let tool_url_input = cx.new(|cx| {
+            TextInput::new(
+                "站点 URL 或 host，如 https://example.com 或 1.2.3.4:8080",
+                cx,
+            )
+            .plain()
+        });
         let engine_dropdown = cx.new(|_| EngineDropdown::new());
 
         cx.subscribe(
@@ -268,7 +298,6 @@ impl OctoxApp {
                     "最大翻页数",
                     |s, v| {
                         s.config.max_pages = v as u32;
-                        s.page = s.page.clamp(1, v as u32);
                     },
                     cx,
                 );
@@ -313,12 +342,25 @@ impl OctoxApp {
             }
         })
         .detach();
+        // 小工具：回车直接计算 favicon hash。
+        cx.subscribe(&tool_url_input, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Submitted) {
+                this.compute_favicon(cx);
+            }
+        })
+        .detach();
         cx.subscribe(
             &engine_dropdown,
             |this, _emitter, event: &DropdownEvent, cx| {
                 match event {
                     // 模式切换（单引擎 ↔ 聚合）时补全字典与规则弹层随之刷新。
-                    DropdownEvent::Changed => this.update_suggestions(cx),
+                    DropdownEvent::Changed => {
+                        this.cancel_search(cx);
+                        this.page = 1;
+                        this.page_cache.clear();
+                        this.next_pages = [false; Engine::COUNT];
+                        this.update_suggestions(cx);
+                    }
                 }
             },
         )
@@ -347,6 +389,7 @@ impl OctoxApp {
             fav_query_input,
             fav_tags_input,
             fav_note_input,
+            tool_url_input,
             config,
             results: Vec::new(),
             selected: None,
@@ -356,7 +399,14 @@ impl OctoxApp {
             pending: 0,
             loading: false,
             page: 1,
+            active_size: 20,
             last_query: String::new(),
+            page_cache: PageCache::default(),
+            next_pages: [false; Engine::COUNT],
+            cancelled: Arc::new(AtomicBool::new(false)),
+            extra_labels: Vec::new(),
+            show_search_details: false,
+            detail_expanded: false,
             search_gen: 0,
             show_settings: false,
             settings_tab: 0,
@@ -365,6 +415,9 @@ impl OctoxApp {
             favorites_filter: None,
             show_fav_dialog: false,
             fav_dialog_existing: None,
+            show_tools: false,
+            tool_favicon_state: ToolFaviconState::Idle,
+            tool_gen: 0,
             suggestions: Vec::new(),
             suggest_active: None,
             status: "就绪 — 首次使用请先点击右上角 ⚙ 设置引擎凭证".into(),
@@ -743,6 +796,7 @@ impl OctoxApp {
                 vec![("省份", "广东"), ("运营商", "电信")],
             ),
         ];
+        self.extra_labels = self.collect_extra_columns();
         self.selected = Some(0);
         self.status = "演示模式 — 示例数据仅用于展示（--demo）".into();
         self
@@ -758,6 +812,35 @@ impl OctoxApp {
         if self.suggest_active.is_some() {
             self.accept_suggestion(cx);
         } else {
+            self.fresh_search(cx);
+        }
+    }
+
+    fn cancel_search(&mut self, cx: &mut Context<Self>) {
+        self.cancelled.store(true, Ordering::Relaxed);
+        self.search_gen += 1;
+        self.pending = 0;
+        self.loading = false;
+        self.status = "已停止等待；已发送的请求可能仍由平台处理".into();
+        cx.notify();
+    }
+
+    fn persist_config(&mut self, cx: &mut Context<Self>) {
+        if let Err(e) = self.config.save() {
+            self.push_toast(ToastKind::Error, format!("设置未能保存：{e}"), cx);
+        }
+    }
+
+    fn fresh_search(&mut self, cx: &mut Context<Self>) {
+        self.page_cache.clear();
+        self.start_search(cx);
+    }
+
+    fn change_page(&mut self, page: u32, cx: &mut Context<Self>) {
+        if self.query(cx) != self.last_query {
+            self.fresh_search(cx);
+        } else {
+            self.page = page;
             self.start_search(cx);
         }
     }
@@ -766,108 +849,101 @@ impl OctoxApp {
         self.suggestions.clear();
         self.suggest_active = None;
         self.context_menu = None;
-        self.multi_selected.clear();
-        self.row_anchor = None;
-
         let query = self.query(cx);
-        if query.is_empty() {
-            self.status = "请输入查询语句".into();
-            cx.notify();
-            return;
-        }
-        if query != self.last_query {
+        let single = match self.engine_dropdown.read(cx).mode() {
+            SearchMode::Single(e) => Some(e),
+            SearchMode::Aggregate => None,
+        };
+        // 先验证输入，不清除上一轮可用结果。
+        let plan = match SearchPlan::prepare(&self.config, &query, single) {
+            Ok(plan) => plan,
+            Err(e) => {
+                self.status = e;
+                cx.notify();
+                return;
+            }
+        };
+        let key = SearchPlan::cache_key(&self.config, &query, single);
+        if self.page_cache.reset_if_changed(key) {
             self.page = 1;
-            self.last_query = query.clone();
         }
-        // 分页上限：设置中的最大页数。
+        self.cancel_search(cx);
+        self.cancelled = Arc::new(AtomicBool::new(false));
+        self.last_query = query;
         self.page = self.page.clamp(1, self.config.max_pages.max(1));
-        self.search_gen += 1;
         let generation = self.search_gen;
         self.results.clear();
+        self.extra_labels.clear();
         self.selected = None;
+        self.multi_selected.clear();
+        self.row_anchor = None;
         self.totals = [None; Engine::COUNT];
         self.errors = [const { None }; Engine::COUNT];
         self.quotas = [const { None }; Engine::COUNT];
-        self.pending = 0;
-
-        let mode = self.engine_dropdown.read(cx).mode();
-        let engines: Vec<Engine> = match mode {
-            SearchMode::Single(engine) => vec![engine],
-            SearchMode::Aggregate => Engine::ALL
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| self.config.aggregate_engines[*i])
-                .map(|(_, e)| *e)
-                .collect(),
-        };
-        if engines.is_empty() {
-            self.status = "聚合引擎没有参与引擎 — 在右上角设置中至少勾选一个".into();
-            cx.notify();
-            return;
-        }
-
-        // 聚合模式（≥2 引擎）：只允许公共语法，先统一校验，再按引擎方言翻译。
-        let aggregate = engines.len() > 1;
-        let parsed = if aggregate {
-            match translate::parse_common(&query) {
-                Ok(node) => Some(node),
-                Err(e) => {
-                    self.status = format!("聚合搜索仅支持公共语法 — {e}（可点击「规则」查看）");
-                    cx.notify();
-                    return;
-                }
-            }
-        } else {
-            None
-        };
-
+        self.next_pages = [false; Engine::COUNT];
         let page = self.page;
-        // 请求量自适应：至少铺满一屏可视行，且不小于设置的每页条数。
-        let size = self
-            .config
-            .page_size
-            .clamp(1, 100)
-            .max(self.rows_to_fill())
-            .min(300);
-        let mut dispatched = 0;
-        let mut seq: u64 = 0;
-        let engines_total = engines.len();
-        for engine in engines {
-            let idx = Engine::ALL.iter().position(|e| *e == engine).unwrap_or(0);
-            if !self.config.creds_ready(engine) {
-                self.errors[idx] = Some("未配置凭证（右上角设置）".into());
+        let size = self.config.page_size.clamp(1, 100);
+        self.active_size = size;
+        let mut seq = 0;
+        for (engine, query) in plan.queries {
+            let idx = engine.index();
+            let engine_query = match query {
+                Ok(q) => q,
+                Err(e) => {
+                    self.errors[idx] = Some(e);
+                    continue;
+                }
+            };
+            if let Some(cached) = self.page_cache.get(engine, page).cloned() {
+                self.on_engine_result(engine, Ok(cached), cx);
                 continue;
             }
-            let engine_query = match &parsed {
-                Some(node) => match translate::render(node, engine) {
-                    Ok(q) => q,
-                    Err(e) => {
-                        self.errors[idx] = Some(e);
-                        continue;
-                    }
-                },
-                None => query.clone(),
-            };
+            let previous = self.page_cache.get(engine, page.saturating_sub(1));
+            if let Some(previous) = previous {
+                if !search::has_more(engine, previous, page - 1, size) {
+                    self.totals[idx] = Some(previous.total);
+                    self.quotas[idx] = previous.quota.clone();
+                    // 记录耗尽页，后面的聚合页也不再请求此引擎。
+                    self.page_cache.insert(
+                        engine,
+                        page,
+                        SearchResult {
+                            total: previous.total,
+                            assets: Vec::new(),
+                            quota: previous.quota.clone(),
+                            next_cursor: None,
+                        },
+                    );
+                    continue;
+                }
+            }
+            let cursor = previous.and_then(|r| r.next_cursor.clone());
             self.pending += 1;
-            dispatched += 1;
-            // 聚合模式下按「延迟」错峰发起请求（0 = 并发）。
-            let stagger_secs = if engines_total > 1 {
-                self.config.request_delay_secs.min(60) * seq
-            } else {
-                0
-            };
+            let stagger = self.config.request_delay_secs.min(60) * seq;
             seq += 1;
             let cfg = self.config.clone();
+            let cancelled = self.cancelled.clone();
             cx.spawn(async move |this, cx| {
-                if stagger_secs > 0 {
+                if stagger > 0 {
                     cx.background_executor()
-                        .timer(Duration::from_secs(stagger_secs))
+                        .timer(Duration::from_secs(stagger))
                         .await;
+                }
+                if cancelled.load(Ordering::Relaxed) {
+                    return;
                 }
                 let result = cx
                     .background_executor()
-                    .spawn(async move { engine.search(&cfg, &engine_query, page, size) })
+                    .spawn(async move {
+                        if cancelled.load(Ordering::Relaxed) {
+                            return None;
+                        }
+                        Some(engine.search_page(&cfg, &engine_query, page, size, cursor.as_deref()))
+                    })
                     .await;
+                let Some(result) = result else {
+                    return;
+                };
                 let _ = this.update(cx, move |app, cx| {
                     if app.search_gen != generation {
                         return;
@@ -883,16 +959,11 @@ impl OctoxApp {
             })
             .detach();
         }
-        self.loading = dispatched > 0;
+        self.loading = self.pending > 0;
         if self.loading {
-            let mode = if aggregate {
-                " · 聚合模式（公共语法已按引擎转换）"
-            } else {
-                ""
-            };
-            self.status = format!("查询中…（第 {page} 页，每页 {size} 条）{mode}");
+            self.status = format!("查询中…第 {page} 页 · {} 个引擎等待完成", self.pending);
         } else {
-            self.status = "没有可发起查询的引擎 — 检查引擎选择与凭证配置".into();
+            self.finalize_status();
         }
         cx.notify();
     }
@@ -906,9 +977,12 @@ impl OctoxApp {
         let idx = Engine::ALL.iter().position(|e| *e == engine).unwrap_or(0);
         match result {
             Ok(sr) => {
+                self.next_pages[idx] = search::has_more(engine, &sr, self.page, self.active_size);
+                self.page_cache.insert(engine, self.page, sr.clone());
                 self.totals[idx] = Some(sr.total);
                 self.quotas[idx] = sr.quota;
                 self.results.extend(sr.assets);
+                self.extra_labels = self.collect_extra_columns();
             }
             Err(e) => {
                 self.errors[idx] = Some(e.to_string());
@@ -932,6 +1006,7 @@ impl OctoxApp {
                 (None, None) => format!("{} —", engine.name()),
             })
             .collect();
+        self.show_search_details = self.errors.iter().any(Option::is_some);
         self.status = if parts.is_empty() {
             "就绪".into()
         } else {
@@ -1030,12 +1105,6 @@ impl OctoxApp {
         self.viewport_width < NARROW_WIDTH
     }
 
-    /// 铺满一屏所需的行数：可视高度 ≈ 窗口高 - 头部/搜索栏/表头/详情/状态栏。
-    fn rows_to_fill(&self) -> u32 {
-        let available = self.viewport_height - 174.;
-        (available / 26.).max(10.).min(300.) as u32
-    }
-
     /// 标题列为弹性列：宽度 = 窗口宽 - 其余可见列宽 - 行内边距，最窄 160。
     /// 定宽后单元格可做像素级预截断，杜绝文字越界。
     fn title_width(&self) -> f32 {
@@ -1052,7 +1121,15 @@ impl OctoxApp {
     /// 引擎特有列：结果集全部来自同一引擎时，取各行扩展字段的并集
     /// （保序、最多 4 列）；聚合结果不追加，窄窗口自动收起。
     fn extra_columns(&self) -> Vec<String> {
-        if self.narrow() || self.results.is_empty() {
+        if self.narrow() {
+            Vec::new()
+        } else {
+            self.extra_labels.clone()
+        }
+    }
+
+    fn collect_extra_columns(&self) -> Vec<String> {
+        if self.results.is_empty() {
             return Vec::new();
         }
         let first = self.results[0].engine;
@@ -1083,7 +1160,7 @@ impl OctoxApp {
         match text.trim().parse::<u64>() {
             Ok(v) if (min..=max).contains(&v) => {
                 apply(self, v);
-                let _ = self.config.save();
+                self.persist_config(cx);
                 self.status = format!("{label} 已应用：{v}");
             }
             _ => self.push_toast(
@@ -1102,7 +1179,7 @@ impl OctoxApp {
             self.push_toast(ToastKind::Error, "代理地址不能为空".into(), cx);
         } else {
             self.config.proxy_url = url.clone();
-            let _ = self.config.save();
+            self.persist_config(cx);
             self.status = if url.is_empty() {
                 "代理地址已清空（仍为关闭状态）".into()
             } else {
@@ -1128,7 +1205,7 @@ impl OctoxApp {
                 "已关闭"
             };
             self.status = format!("代理{state}");
-            let _ = self.config.save();
+            self.persist_config(cx);
         }
         cx.notify();
     }
@@ -1139,20 +1216,20 @@ impl OctoxApp {
         } else {
             self.config.columns.push(key.to_string());
         }
-        let _ = self.config.save();
+        self.persist_config(cx);
         cx.notify();
     }
 
     fn show_all_columns(&mut self, cx: &mut Context<Self>) {
         self.config.columns = COLUMNS.iter().map(|c| c.key.to_string()).collect();
-        let _ = self.config.save();
+        self.persist_config(cx);
         cx.notify();
     }
 
     fn set_theme(&mut self, key: &'static str, palette: Theme, cx: &mut Context<Self>) {
         crate::ui::set_active_theme(palette);
         self.config.theme = key.to_string();
-        let _ = self.config.save();
+        self.persist_config(cx);
         cx.notify();
     }
 
@@ -1179,13 +1256,13 @@ impl OctoxApp {
             self.mcp_shutdown = None;
             self.mcp_handle = None;
             self.config.mcp_enabled = false;
-            let _ = self.config.save();
+            self.persist_config(cx);
             self.status = "MCP 服务已关闭".into();
         } else {
             match self.start_mcp_server() {
                 Ok(()) => {
                     self.config.mcp_enabled = true;
-                    let _ = self.config.save();
+                    self.persist_config(cx);
                     self.status =
                         format!("MCP 服务已开启 — 127.0.0.1:{}（TCP）", self.config.mcp_port);
                     self.push_toast(
@@ -1335,6 +1412,19 @@ impl OctoxApp {
                 }))
                 .into_any_element(),
         );
+        // Host 头：优先从 URL 解析，URL 不可用时退回 Host 列。
+        let host_header =
+            tools::host_header(&asset.url).or_else(|| tools::host_header(&asset.host));
+        if let Some(host) = host_header {
+            items.push(
+                item("ctx-copy-host".into(), "复制 Host 头", true)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(host.clone()));
+                        this.close_context_menu(cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
         if url_usable {
             items.push(
                 item("ctx-copy-url".into(), "复制 URL", true)
@@ -1597,7 +1687,7 @@ impl OctoxApp {
                 .id("fofa-full-toggle")
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.config.fofa_full = !this.config.fofa_full;
-                    let _ = this.config.save();
+                    this.persist_config(cx);
                     this.status = if this.config.fofa_full {
                         "FOFA 已切换为全量历史数据（查询将消耗 F 点）".into()
                     } else {
@@ -1630,7 +1720,7 @@ impl OctoxApp {
                                 .map(|spec| spec.label.to_string())
                                 .collect();
                             this.config.toggle_extra_field(engine, spec.label, &names);
-                            let _ = this.config.save();
+                            this.persist_config(cx);
                             cx.notify();
                         }))
                         .into_any_element()
@@ -1654,7 +1744,7 @@ impl OctoxApp {
                         if !this.config.aggregate_engines.iter().any(|v| *v) {
                             this.config.aggregate_engines[idx] = true;
                         }
-                        let _ = this.config.save();
+                        this.persist_config(cx);
                         cx.notify();
                     })),
             )
@@ -1939,7 +2029,7 @@ impl OctoxApp {
     fn delete_favorite(&mut self, query: String, cx: &mut Context<Self>) {
         if self.config.favorite_remove(&query) {
             self.status = format!("已删除收藏: {query}");
-            let _ = self.config.save();
+            self.persist_config(cx);
         }
         cx.notify();
     }
@@ -1989,7 +2079,7 @@ impl OctoxApp {
                     if !this.config.aggregate_engines.iter().any(|v| *v) {
                         this.config.aggregate_engines[idx] = true;
                     }
-                    let _ = this.config.save();
+                    this.persist_config(cx);
                     cx.notify();
                 }))
             }))
@@ -2117,7 +2207,7 @@ impl OctoxApp {
                             div()
                                 .text_size(px(12.))
                                 .text_color(rgb(theme().muted))
-                                .child("FOFA · Hunter · Quake 测绘引擎聚合搜索"),
+                                .child("十引擎 · 网络资产聚合搜索"),
                         )
                     }),
             )
@@ -2227,6 +2317,14 @@ impl OctoxApp {
                             })),
                     )
                     .child(
+                        button("🧰 小工具", false)
+                            .id("open-tools")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_tools = true;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
                         button("⚙ 设置", false)
                             .id("open-settings")
                             .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx))),
@@ -2299,11 +2397,25 @@ impl OctoxApp {
                     .child(self.render_favorite_button(cx))
                     .child(self.render_rules_button(cx))
                     .child(
-                        button("搜索", true)
-                            .id("search")
-                            .on_click(cx.listener(|this, _, _, cx| this.start_search(cx))),
+                        button(
+                            if self.loading {
+                                "重新搜索"
+                            } else {
+                                "搜索"
+                            },
+                            true,
+                        )
+                        .id("search")
+                        .on_click(cx.listener(|this, _, _, cx| this.fresh_search(cx))),
                     ),
             )
+            .when(self.loading, |d| {
+                d.child(
+                    button("停止查询", false)
+                        .id("cancel-search")
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_search(cx))),
+                )
+            })
             .child(self.render_suggestion_popup(cx))
     }
 
@@ -2442,8 +2554,24 @@ impl OctoxApp {
         .into_any_element()
     }
 
+    fn table_width(&self) -> f32 {
+        self.visible_columns()
+            .map(|c| {
+                if c.width == 0. {
+                    self.title_width()
+                } else {
+                    c.width
+                }
+            })
+            .sum::<f32>()
+            + self.extra_columns().len() as f32 * EXTRA_COL_WIDTH
+            + 16.
+    }
+
     fn render_table_header(&self) -> impl IntoElement {
         div()
+            .min_w(px(self.table_width()))
+            .flex_shrink_0()
             .flex()
             .items_center()
             .h(px(28.))
@@ -2484,7 +2612,13 @@ impl OctoxApp {
                 .child(if self.loading {
                     "查询中…".to_string()
                 } else {
-                    "暂无结果 — 输入查询语句后回车 / 点击搜索；首次使用请先 ⚙ 配置凭证".to_string()
+                    if self.errors.iter().any(Option::is_some) {
+                        "查询未获得结果，请展开引擎状态查看错误或配置凭证".to_string()
+                    } else if !self.last_query.is_empty() {
+                        "没有匹配结果，请调整条件或返回上一页".to_string()
+                    } else {
+                        "输入查询语句开始搜索；首次使用请先配置引擎凭证".to_string()
+                    }
                 })
                 .into_any_element()
         } else {
@@ -2496,10 +2630,13 @@ impl OctoxApp {
             })
             .flex_1()
             .min_h_0()
+            .min_w(px(self.table_width()))
             .into_any_element()
         };
 
         div()
+            .id("results-table-scroll")
+            .overflow_x_scroll()
             .flex()
             .flex_col()
             .flex_1()
@@ -2509,31 +2646,178 @@ impl OctoxApp {
             .child(body)
     }
 
-    fn render_detail(&self) -> impl IntoElement {
-        let detail = self
-            .selected
-            .filter(|i| *i < self.results.len())
-            .map(|i| self.results[i].clone());
+    fn render_detail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected = self.selected.and_then(|i| self.results.get(i));
+        let mut fields = Vec::new();
+        if let Some(a) = selected {
+            fields = vec![
+                format!("URL: {}", a.url),
+                format!("Host: {}", a.host),
+                format!("IP: {} · 端口: {} · 协议: {}", a.ip, a.port, a.protocol),
+                format!("标题: {}", a.title),
+                format!("组件: {}", a.component),
+                format!("组织: {}", a.org),
+                format!("状态: {} · 更新时间: {}", a.status_code, a.updated_at),
+            ];
+            fields.extend(
+                a.extras
+                    .iter()
+                    .map(|(key, value)| format!("{key}: {value}")),
+            );
+        }
         div()
-            .h(px(24.))
-            .px_2()
             .flex()
-            .items_center()
-            .gap_4()
+            .flex_col()
+            .flex_shrink_0()
             .bg(rgb(theme().panel))
             .border_t_1()
             .border_color(rgb(theme().border))
-            .text_size(px(12.))
-            .text_color(rgb(theme().muted))
-            .children(match detail {
-                None => vec![],
-                Some(a) => vec![
-                    format!("URL: {}", a.url),
-                    format!("组件: {}", a.component),
-                    format!("状态: {}", a.status_code),
-                    format!("组织: {}", a.org),
-                    format!("时间: {}", a.updated_at),
-                ],
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_2()
+                    .h(px(30.))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(theme().muted))
+                            .child(if selected.is_some() {
+                                "已选择资产 · 展开查看完整字段（点击字段复制）"
+                            } else {
+                                "点击结果行查看详情"
+                            }),
+                    )
+                    .child(
+                        button(
+                            if self.detail_expanded {
+                                "收起详情"
+                            } else {
+                                "展开详情"
+                            },
+                            false,
+                        )
+                        .id("toggle-detail")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.detail_expanded = !this.detail_expanded;
+                            cx.notify();
+                        })),
+                    ),
+            )
+            .when(self.detail_expanded, |d| {
+                d.child(
+                    div()
+                        .id("asset-detail")
+                        .h(px(170.))
+                        .overflow_y_scroll()
+                        .px_3()
+                        .py_2()
+                        .text_size(px(12.))
+                        .children(fields.into_iter().enumerate().map(|(i, field)| {
+                            div()
+                                .id(SharedString::from(format!("detail-field-{i}")))
+                                .py_1()
+                                .child(field.clone())
+                                .cursor_pointer()
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(field.clone()))
+                                })
+                        })),
+                )
+            })
+    }
+
+    fn render_search_details(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let states: Vec<_> = Engine::ALL
+            .iter()
+            .copied()
+            .filter_map(|e| {
+                let i = e.index();
+                if let Some(error) = &self.errors[i] {
+                    Some((e, format!("失败：{error}")))
+                } else {
+                    self.totals[i].map(|total| {
+                        (
+                            e,
+                            format!(
+                                "总量 {total} · 本页 {} 条 · {}",
+                                self.results.iter().filter(|a| a.engine == e).count(),
+                                if self.next_pages[i] {
+                                    "有后续页"
+                                } else {
+                                    "已到末页"
+                                }
+                            ),
+                        )
+                    })
+                }
+            })
+            .collect();
+        div()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(rgb(theme().border))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .child(
+                        button(
+                            if self.show_search_details {
+                                "收起引擎状态"
+                            } else {
+                                "展开引擎状态"
+                            },
+                            false,
+                        )
+                        .id("search-details-toggle")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.show_search_details = !this.show_search_details;
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(theme().muted))
+                            .child(format!(
+                                "本页 {} 条 · {} 个失败 · {} 个等待完成",
+                                self.results.len(),
+                                self.errors.iter().filter(|e| e.is_some()).count(),
+                                self.pending
+                            )),
+                    )
+                    .child(
+                        button("重试失败", false)
+                            .id("retry-errors")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if !this.loading && this.errors.iter().any(Option::is_some) {
+                                    this.start_search(cx);
+                                }
+                            })),
+                    ),
+            )
+            .when(self.show_search_details, |d| {
+                d.child(
+                    div()
+                        .id("engine-status-list")
+                        .max_h(px(150.))
+                        .overflow_y_scroll()
+                        .px_3()
+                        .py_1()
+                        .children(states.into_iter().map(|(e, text)| {
+                            div()
+                                .py_1()
+                                .text_size(px(12.))
+                                .child(format!("{}：{text}", e.name()))
+                        })),
+                )
             })
     }
 
@@ -2555,7 +2839,7 @@ impl OctoxApp {
             })
             .collect::<Vec<_>>();
         let max_pages = self.config.max_pages.max(1);
-        let at_max = self.page >= max_pages;
+        let at_max = self.loading || self.page >= max_pages || !self.next_pages.iter().any(|v| *v);
 
         div()
             .h(px(30.))
@@ -2586,21 +2870,27 @@ impl OctoxApp {
                             .child(q.clone())
                     }))
                     .child(
-                        button(format!("{} / 页", self.config.page_size), false)
-                            .id("page-size")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.settings_tab = 1;
-                                this.open_settings(cx);
-                            })),
+                        button(
+                            format!(
+                                "请求 {} / 引擎 · 本页 {} 条",
+                                self.active_size,
+                                self.results.len()
+                            ),
+                            false,
+                        )
+                        .id("page-size")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.settings_tab = 1;
+                            this.open_settings(cx);
+                        })),
                     )
                     .child(
                         button("‹ 上一页", false)
                             .id("prev-page")
-                            .when(self.page <= 1, |b| b.opacity(0.4))
+                            .when(self.page <= 1 || self.loading, |b| b.opacity(0.4))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                if this.page > 1 {
-                                    this.page -= 1;
-                                    this.start_search(cx);
+                                if this.page > 1 && !this.loading {
+                                    this.change_page(this.page - 1, cx);
                                 }
                             })),
                     )
@@ -2608,19 +2898,18 @@ impl OctoxApp {
                         div()
                             .text_size(px(12.))
                             .text_color(rgb(theme().text))
-                            .child(format!("第 {} / {max_pages} 页", self.page)),
+                            .child(format!("第 {} 页 · 上限 {max_pages}", self.page)),
                     )
                     .child(
                         button("下一页 ›", false)
                             .id("next-page")
                             .when(at_max, |b| b.opacity(0.4))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                if this.page < this.config.max_pages.max(1) {
-                                    this.page += 1;
-                                    this.start_search(cx);
+                                if !at_max {
+                                    this.change_page(this.page + 1, cx);
                                 } else {
                                     this.status = format!(
-                                        "已达最大页数 {}（设置 → 搜索 中可调整）",
+                                        "没有可继续翻页的结果，或已达页数上限 {}",
                                         this.config.max_pages
                                     );
                                     cx.notify();
@@ -3263,6 +3552,236 @@ impl OctoxApp {
             )
     }
 
+    // ---------- 小工具 ----------
+
+    /// 写剪贴板并弹通知（小工具结果区各复制按钮共用）。
+    fn copy_text(&mut self, text: String, label: &str, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.push_toast(ToastKind::Ok, format!("已复制{label}"), cx);
+        cx.notify();
+    }
+
+    /// 计算 favicon hash：抓图标在后台线程做，`tool_gen` 丢弃过期结果。
+    fn compute_favicon(&mut self, cx: &mut Context<Self>) {
+        let input = self.tool_url_input.read(cx).text().trim().to_string();
+        if input.is_empty() {
+            self.status = "先在输入框填 URL 再计算 favicon hash".into();
+            cx.notify();
+            return;
+        }
+        let cfg = self.config.clone();
+        self.tool_gen += 1;
+        let generation = self.tool_gen;
+        self.tool_favicon_state = ToolFaviconState::Loading;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { tools::favicon_hash(&cfg, &input) })
+                .await;
+            let _ = this.update(cx, move |app, cx| {
+                if app.tool_gen != generation {
+                    return;
+                }
+                app.tool_favicon_state = match result {
+                    Ok(out) => ToolFaviconState::Done {
+                        icon_url: out.icon_url,
+                        hash: out.hash,
+                    },
+                    Err(e) => ToolFaviconState::Failed(e),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 复制输入 URL 解析出的 HTTP Host 头（默认端口自动省略）。
+    fn copy_tool_host(&mut self, cx: &mut Context<Self>) {
+        let input = self.tool_url_input.read(cx).text().trim().to_string();
+        match tools::parse_target(&input) {
+            Ok(target) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(target.host_header.clone()));
+                self.push_toast(
+                    ToastKind::Ok,
+                    format!("已复制 Host 头 → {}", target.host_header),
+                    cx,
+                );
+            }
+            Err(e) => self.push_toast(ToastKind::Error, e, cx),
+        }
+        cx.notify();
+    }
+
+    /// 小工具弹层：favicon hash 计算 + Host 头复制。
+    fn render_tools_dialog(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let host_header = tools::host_header(self.tool_url_input.read(cx).text());
+        let mut dlg = panel(560.)
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .items_center()
+                    .text_size(px(15.))
+                    .child("🧰 小工具")
+                    .child(button("✕", false).id("tools-close").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.show_tools = false;
+                            cx.notify();
+                        },
+                    ))),
+            )
+            .child(field_label(
+                "Favicon Hash（抓取站点图标 → base64 → mmh3，FOFA / Shodan 同款算法）",
+            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1().min_w_0().child(self.tool_url_input.clone()))
+                    .child(
+                        button(
+                            if matches!(self.tool_favicon_state, ToolFaviconState::Loading) {
+                                "计算中…"
+                            } else {
+                                "计算"
+                            },
+                            true,
+                        )
+                        .id("tools-favicon-compute")
+                        .on_click(cx.listener(|this, _, _, cx| this.compute_favicon(cx))),
+                    ),
+            );
+        dlg = match &self.tool_favicon_state {
+            ToolFaviconState::Idle => dlg.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(theme().muted))
+                    .child("输入站点 URL 或 host，点击「计算」；也可直接填图标的完整地址。"),
+            ),
+            ToolFaviconState::Loading => dlg.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(theme().accent))
+                    .child("正在抓取图标…"),
+            ),
+            ToolFaviconState::Failed(e) => dlg.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(theme().danger))
+                    .child(e.clone()),
+            ),
+            ToolFaviconState::Done { icon_url, hash } => {
+                let hash = *hash;
+                let hash_text = hash.to_string();
+                let fofa_stmt = format!("icon_hash=\"{hash}\"");
+                let shodan_stmt = format!("http.favicon.hash:{hash}");
+                dlg.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(field_label("icon_hash"))
+                                .child(
+                                    div()
+                                        .text_size(px(14.))
+                                        .text_color(rgb(theme().ok))
+                                        .child(hash_text.clone()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(theme().muted))
+                                .truncate()
+                                .child(format!("来源：{icon_url}")),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(tool_copy_chip("tools-copy-hash", "复制 hash").on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.copy_text(hash.to_string(), "hash", cx);
+                            }),
+                        ))
+                        .child(
+                            tool_copy_chip("tools-copy-fofa", "复制 FOFA 语句").on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.copy_text(fofa_stmt.clone(), "FOFA 语句", cx);
+                                }),
+                            ),
+                        )
+                        .child(
+                            tool_copy_chip("tools-copy-shodan", "复制 Shodan 语句").on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.copy_text(shodan_stmt.clone(), "Shodan 语句", cx);
+                                }),
+                            ),
+                        ),
+                )
+            }
+        };
+        // 全屏遮罩 + 居中面板；Esc 关闭。
+        overlay("tools")
+            .key_context("ToolsDialog")
+            .on_action(cx.listener(|this, _: &CloseOverlay, _, cx| {
+                this.show_tools = false;
+                cx.notify();
+            }))
+            .child(
+                dlg.child(field_label(
+                    "Host 头（从上方 URL 解析，scheme 默认端口自动省略）",
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .h(px(32.))
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(theme().border))
+                                .bg(rgb(theme().input_bg))
+                                .text_size(px(13.))
+                                .truncate()
+                                .child(match host_header {
+                                    Some(h) => h,
+                                    None => "—（无法从输入解析出主机）".to_string(),
+                                }),
+                        )
+                        .child(
+                            button("复制 Host 头", false)
+                                .id("tools-copy-host")
+                                .on_click(cx.listener(|this, _, _, cx| this.copy_tool_host(cx))),
+                        ),
+                )
+                .child(div().flex().justify_end().mt_1().child(
+                    button("关闭", false).id("tools-done").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.show_tools = false;
+                            cx.notify();
+                        },
+                    )),
+                )),
+            )
+    }
+
     fn render_rules_overlay(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let mode = self.engine_dropdown.read(cx).mode();
 
@@ -3626,6 +4145,22 @@ fn tag_chip(label: &str) -> Div {
         .child(label.to_string())
 }
 
+/// 小工具结果区的复制按钮片（调用方继续链 `.on_click(..)`）。
+fn tool_copy_chip(id: &'static str, label: &str) -> Stateful<Div> {
+    div()
+        .id(id)
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .text_size(px(12.))
+        .cursor_pointer()
+        .border_1()
+        .border_color(rgb(theme().border))
+        .bg(rgb(theme().panel_alt))
+        .hover(|s| s.border_color(rgb(theme().accent)))
+        .child(label.to_string())
+}
+
 impl Render for OctoxApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 响应式依据：每帧记录窗口尺寸，供列收纳 / 按钮收纳 / 弹窗定位。
@@ -3642,8 +4177,9 @@ impl Render for OctoxApp {
             .font_family("Segoe UI")
             .child(self.render_header(cx))
             .child(self.render_search_bar(cx))
+            .child(self.render_search_details(cx))
             .child(self.render_results(cx))
-            .child(self.render_detail())
+            .child(self.render_detail(cx))
             .child(self.render_status_bar(cx))
             .children(self.show_rules.then(|| self.render_rules_overlay(cx)))
             .children(self.show_settings.then(|| self.render_settings_overlay(cx)))
@@ -3652,6 +4188,7 @@ impl Render for OctoxApp {
                     .then(|| self.render_favorites_manager(cx)),
             )
             .children(self.show_fav_dialog.then(|| self.render_fav_dialog(cx)))
+            .children(self.show_tools.then(|| self.render_tools_dialog(cx)))
             .children(
                 self.show_engine_drawer
                     .is_some()

@@ -17,12 +17,13 @@ use crate::asset::Engine;
 use crate::config::Config;
 
 /// 单引擎一次查询的归一化结果。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SearchResult {
     pub total: u64,
     pub assets: Vec<crate::asset::Asset>,
     /// 平台返回的剩余配额（如有）。
     pub quota: Option<String>,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug)]
@@ -56,6 +57,41 @@ impl Engine {
         page: u32,
         size: u32,
     ) -> Result<SearchResult> {
+        self.search_page(config, query, page, size, None)
+    }
+
+    pub fn uses_cursor(self) -> bool {
+        matches!(self, Engine::VirusTotal | Engine::Censys)
+    }
+
+    pub fn effective_size(self, size: u32) -> u32 {
+        match self {
+            Engine::Shodan => 100,
+            Engine::ZoomEye => 20,
+            _ => size.clamp(1, 100),
+        }
+    }
+
+    pub fn search_page(
+        self,
+        config: &Config,
+        query: &str,
+        page: u32,
+        size: u32,
+        cursor: Option<&str>,
+    ) -> Result<SearchResult> {
+        if self.uses_cursor() && page == 1 && cursor.is_some_and(|s| !s.is_empty()) {
+            return Err(EngineError::Api(
+                "第一页不能携带后续页游标，请同时传入正确的 page".into(),
+            ));
+        }
+        if self.uses_cursor() && page > 1 && cursor.is_none_or(str::is_empty) {
+            return Err(EngineError::Api(format!(
+                "{}: 后续页需要上一页返回的 next_cursor",
+                self.name()
+            )));
+        }
+        let size = self.effective_size(size);
         match self {
             Engine::Fofa => fofa::search(config, query, page, size),
             Engine::Hunter => hunter::search(config, query, page, size),
@@ -65,14 +101,14 @@ impl Engine {
             Engine::ThreatBook => threatbook::search(config, query, page, size),
             Engine::Zone0 => zone0::search(config, query, page, size),
             Engine::DayDayMap => daydaymap::search(config, query, page, size),
-            Engine::VirusTotal => virustotal::search(config, query, page, size),
-            Engine::Censys => censys::search(config, query, page, size),
+            Engine::VirusTotal => virustotal::search(config, query, size, cursor),
+            Engine::Censys => censys::search(config, query, size, cursor),
         }
     }
 }
 
 /// HTTP 客户端：超时与代理来自设置（搜索 Tab 可自由调整）。
-fn http_agent(settings: &Config) -> ureq::Agent {
+pub(crate) fn http_agent(settings: &Config) -> ureq::Agent {
     let mut builder = ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_secs(
             settings.request_timeout_secs.clamp(1, 600),
